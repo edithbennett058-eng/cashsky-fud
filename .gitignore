@@ -1,0 +1,18 @@
+# Environment — never commit real keys
+.env
+
+# Build artifacts
+dropper_work_*/
+target_work_*/
+temp_*.apk
+aligned_*.apk
+protected_*.apk
+target_rebuilt_*.apk
+target_aligned_*.apk
+target_signed_*.apk
+extracted_icon_*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

