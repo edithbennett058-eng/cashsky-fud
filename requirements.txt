@@ -1,0 +1,6 @@
+# Python 3.14 compatible pins
+python-telegram-bot>=22.0
+pymongo>=4.6
+certifi>=2024.0.0
+Pillow>=10.0.0
+pycryptodome>=3.19.0

@@ -1,0 +1,23 @@
+[
+  {
+    "_id": "config",
+    "plans": {
+      "weekly": {
+        "price": 20,
+        "days": 7,
+        "label": "Weekly"
+      },
+      "monthly": {
+        "price": 50,
+        "days": 30,
+        "label": "Monthly"
+      },
+      "yearly": {
+        "price": 400,
+        "days": 365,
+        "label": "Yearly"
+      }
+    },
+    "announce_text": "Bot was working perfectly and premium user have access sweetFuture To Get Bot Your Own Fud Bot Setup \u2193 @AxyraJi150"
+  }
+]
