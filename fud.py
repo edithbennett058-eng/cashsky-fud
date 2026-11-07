@@ -1731,8 +1731,10 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
         app_name = app_name_sanitized
 
         target_package_name = "com.example.app"
+        target_root = None
+        target_tree = None
+        target_manifest_path = os.path.join(target_work_dir, 'AndroidManifest.xml')
         try:
-            target_manifest_path = os.path.join(target_work_dir, 'AndroidManifest.xml')
             target_tree = ET.parse(target_manifest_path)
             target_root = target_tree.getroot()
             target_package = target_root.get('package')
@@ -1776,6 +1778,8 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
         print(f"    Patched {total_patched} smali files")
 
         try:
+            if target_root is None:
+                raise ValueError("manifest not parsed")
             app_element = target_root.find('application')
             if app_element is not None:
                 app_name_attr = app_element.get('{http://schemas.android.com/apk/res/android}name')
