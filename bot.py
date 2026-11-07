@@ -18,6 +18,7 @@ from pymongo import MongoClient
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.constants import ChatAction, ParseMode, ChatMemberStatus
+from telegram.error import NetworkError, TimedOut
 from fud import bind_apk, extract_app_name_from_apk, extract_icon_from_apk
 try:
     from bson import ObjectId
@@ -1883,7 +1884,22 @@ def main():
         sys.exit(1)
     # seed default plans
     get_plans()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        # Generous timeouts — network hiccups on Windows/VPS shouldn't kill the loop.
+        # get_updates_read_timeout is the long-poll window; set to 42 s (Telegram's
+        # recommended max) so the socket stays alive between update batches.
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(60.0)
+        .pool_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(42.0)
+        .get_updates_write_timeout(30.0)
+        .get_updates_pool_timeout(30.0)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("build", build_command))
     app.add_handler(CommandHandler("plans", plans_command))
@@ -1934,7 +1950,11 @@ def main():
     # Daily job: auto-expire and notify users whose premium/special plan ran out
     app.job_queue.run_repeating(check_expired_subscriptions, interval=86400, first=60)
     print("PlayRemove FUD started — channel gate + plans + full admin panel")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,       # discard stale updates from while bot was offline
+        timeout=30,                      # getUpdates long-poll timeout (seconds)
+    )
 
 if __name__ == "__main__":
     # Python 3.12+ removed the implicit event loop in the main thread
